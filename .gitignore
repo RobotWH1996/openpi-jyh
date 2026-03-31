@@ -1,14 +1,16 @@
 # Data directories.
 assets/
 checkpoints/
-data/
 wandb/
+
+# data folder: ignore actual data files, keep folder structure via .gitkeep
+data/
+
+# Experiment logs: ignore actual data files, keep folder structure via .gitkeep
+examples/*/logs/
 
 # Large binary / PDF files
 *.pdf
-
-# Experiment logs (images, data files)
-examples/*/logs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

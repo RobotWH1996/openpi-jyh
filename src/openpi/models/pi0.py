@@ -1,4 +1,5 @@
 import logging
+from typing import TYPE_CHECKING
 
 import einops
 import flax.nnx as nnx
@@ -12,6 +13,9 @@ from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
+
+if TYPE_CHECKING:
+    from openpi.rtc.modeling_rtc_jax import RTCProcessorJax
 
 logger = logging.getLogger("openpi")
 
@@ -64,9 +68,18 @@ def posemb_sincos(
 
 
 class Pi0(_model.BaseModel):
-    def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
+    # ===== [RTC] 原始签名 =====
+    # def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
+    # ===== [RTC] 新签名: 增加 rtc_processor 参数 =====
+    def __init__(
+        self,
+        config: pi0_config.Pi0Config,
+        rtc_processor: "RTCProcessorJax | None" = None,
+        rngs: nnx.Rngs = None,
+    ):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.rtc_processor = rtc_processor
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -221,6 +234,9 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        # ===== [RTC] 原始签名无 **kwargs =====
+        **kwargs,
+        # ===== [RTC] 新增: 接收 RTC 参数 (inference_delay, prev_chunk_left_over, execution_horizon) =====
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -236,37 +252,78 @@ class Pi0(_model.BaseModel):
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
-        def step(carry):
-            x_t, time = carry
+        # ===== [RTC] 原始 step 函数（内联式）被替换为 get_v_t + step 分离式 =====
+        # ===== [RTC] 原始代码 START =====
+        # def step(carry):
+        #     x_t, time = carry
+        #     suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+        #         observation, x_t, jnp.broadcast_to(time, batch_size)
+        #     )
+        #     suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+        #     prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+        #     full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+        #     assert full_attn_mask.shape == (
+        #         batch_size,
+        #         suffix_tokens.shape[1],
+        #         prefix_tokens.shape[1] + suffix_tokens.shape[1],
+        #     )
+        #     positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+        #
+        #     (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+        #         [None, suffix_tokens],
+        #         mask=full_attn_mask,
+        #         positions=positions,
+        #         kv_cache=kv_cache,
+        #         adarms_cond=[None, adarms_cond],
+        #     )
+        #     assert prefix_out is None
+        #     v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        #
+        #     return x_t + dt * v_t, time + dt
+        # ===== [RTC] 原始代码 END =====
+
+        # ===== [RTC] 新代码 START: 将模型前向抽取为 get_v_t, step 中根据是否启用 RTC 选择路径 =====
+        def get_v_t(x_t, time, obs):
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
+                obs, x_t, jnp.broadcast_to(time, batch_size)
             )
-            # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
-            # other
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
-            # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
-            # prefix tokens
-            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
-            # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
-            # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
-            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+            prefix_attn_mask_inner = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            full_attn_mask = jnp.concatenate([prefix_attn_mask_inner, suffix_attn_mask], axis=-1)
             assert full_attn_mask.shape == (
                 batch_size,
                 suffix_tokens.shape[1],
                 prefix_tokens.shape[1] + suffix_tokens.shape[1],
             )
-            # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            pos = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
 
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
                 [None, suffix_tokens],
                 mask=full_attn_mask,
-                positions=positions,
+                positions=pos,
                 kv_cache=kv_cache,
                 adarms_cond=[None, adarms_cond],
             )
             assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            return self.action_out_proj(suffix_out[:, -self.action_horizon:])
+
+        prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
+        _use_rtc = self.rtc_processor is not None and prev_chunk_left_over is not None
+
+        def step(carry):
+            x_t, time = carry
+
+            if _use_rtc:
+                v_t = self.rtc_processor.compute_guidance(
+                    x_t=x_t,
+                    time=time,
+                    prev_chunk_left_over=prev_chunk_left_over,
+                    inference_delay=kwargs.get("inference_delay"),
+                    execution_horizon=kwargs.get("execution_horizon"),
+                    model_fn=lambda x: get_v_t(x, time, observation),
+                )
+            else:
+                v_t = get_v_t(x_t, time, observation)
 
             return x_t + dt * v_t, time + dt
 

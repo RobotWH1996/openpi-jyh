@@ -4,6 +4,12 @@ checkpoints/
 data/
 wandb/
 
+# Large binary / PDF files
+*.pdf
+
+# Experiment logs (images, data files)
+examples/*/logs/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

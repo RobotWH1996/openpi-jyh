@@ -57,9 +57,19 @@ class WebsocketPolicyServer:
                 start_time = time.monotonic()
                 obs = msgpack_numpy.unpackb(await websocket.recv())
 
+                # ===== [RTC] 原始代码 =====
+                # infer_time = time.monotonic()
+                # action = self._policy.infer(obs)
+                # infer_time = time.monotonic() - infer_time
+                # ===== [RTC] 新代码: 从 obs 中提取 __rtc_kwargs__ 透传给 policy.infer =====
+                rtc_kwargs = {}
+                if isinstance(obs, dict) and "__rtc_kwargs__" in obs:
+                    rtc_kwargs = obs.pop("__rtc_kwargs__")
+
                 infer_time = time.monotonic()
-                action = self._policy.infer(obs)
+                action = self._policy.infer(obs, **rtc_kwargs)
                 infer_time = time.monotonic() - infer_time
+                # ===== [RTC] 新代码结束 =====
 
                 action["server_timing"] = {
                     "infer_ms": infer_time * 1000,

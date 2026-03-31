@@ -18,7 +18,8 @@ class EnvMode(enum.Enum):
     ALOHA_SIM = "aloha_sim"
     DROID = "droid"
     LIBERO = "libero"
-
+    CR100_OPEN_DOOR = "cr100_open_door"
+    CR100_OPEN_DOOR_PI0 = "cr100_open_door_pi0"
 
 @dataclasses.dataclass
 class Checkpoint:
@@ -51,6 +52,13 @@ class Args:
     # Record the policy's behavior for debugging.
     record: bool = False
 
+    # ===== [RTC] 新增参数 =====
+    rtc: bool = False
+    rtc_execution_horizon: int = 10
+    rtc_max_guidance_weight: float = 10.0
+    rtc_schedule: str = "LINEAR"
+    # ===== [RTC] 新增参数结束 =====
+
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
@@ -73,6 +81,14 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
         config="pi05_libero",
         dir="gs://openpi-assets/checkpoints/pi05_libero",
     ),
+    EnvMode.CR100_OPEN_DOOR: Checkpoint(
+        config="pi05_cr100_open_door_lora",
+        dir="/home/x100/wh/openpi/checkpoints/pi05_cr100_open_door_lora/50000",
+    ),
+    EnvMode.CR100_OPEN_DOOR_PI0: Checkpoint(
+        config="pi0_cr100_action_expert_lora_freeze_vlm",
+        dir="/home/x100/wh/openpi/checkpoints/pi/150000",
+    ),
 }
 
 
@@ -85,13 +101,41 @@ def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) ->
     raise ValueError(f"Unsupported environment mode: {env}")
 
 
+# ===== [RTC] 新增函数 =====
+def _apply_rtc_config(train_config: _config.TrainConfig, args: Args) -> _config.TrainConfig:
+    """Apply RTC configuration to the train config if --rtc is enabled."""
+    if not args.rtc:
+        return train_config
+
+    from openpi.rtc.configuration_rtc import RTCConfig, RTCAttentionSchedule
+
+    rtc_config = RTCConfig(
+        enabled=True,
+        prefix_attention_schedule=RTCAttentionSchedule(args.rtc_schedule),
+        max_guidance_weight=args.rtc_max_guidance_weight,
+        execution_horizon=args.rtc_execution_horizon,
+    )
+
+    new_model_config = dataclasses.replace(train_config.model, rtc_config=rtc_config)
+    return dataclasses.replace(train_config, model=new_model_config)
+# ===== [RTC] 新增函数结束 =====
+
+
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
     match args.policy:
         case Checkpoint():
+            # ===== [RTC] 原始代码 =====
+            # return _policy_config.create_trained_policy(
+            #     _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+            # )
+            # ===== [RTC] 新代码: 在创建 policy 前注入 RTC config =====
+            config = _config.get_config(args.policy.config)
+            config = _apply_rtc_config(config, args)
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                config, args.policy.dir, default_prompt=args.default_prompt
             )
+            # ===== [RTC] 新代码结束 =====
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)
 

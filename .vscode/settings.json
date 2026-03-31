@@ -7,5 +7,6 @@
         "src"
     ],
     "python.testing.unittestEnabled": false,
-    "python.testing.pytestEnabled": true
+    "python.testing.pytestEnabled": true,
+    "cmake.sourceDirectory": "/home/x100/wh/openpi/.venv/lib/python3.11/site-packages/torchcodec/_core"
 }

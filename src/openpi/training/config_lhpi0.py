@@ -6,7 +6,6 @@ import dataclasses
 import difflib
 import logging
 import pathlib
-from pickle import TRUE
 from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
@@ -67,10 +66,6 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
-    # Optional local path to the dataset root directory.
-    # If provided, LeRobot will load metadata/data from this directory instead of
-    # the default cache location (~/.cache/huggingface/lerobot/<repo_id>).
-    lerobot_root: str | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -173,10 +168,6 @@ class ModelTransformFactory(GroupFactory):
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
     repo_id: str = tyro.MISSING
-    # Optional local path to the dataset root directory.
-    # If set, LeRobot will read from this directory and will not attempt to fetch
-    # from the HuggingFace Hub when cache is missing.
-    lerobot_root: str | None = None
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -188,13 +179,10 @@ class DataConfigFactory(abc.ABC):
 
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
-        base_lerobot_root = None if self.base_config is None else self.base_config.lerobot_root
-        lerobot_root = self.lerobot_root if self.lerobot_root is not None else base_lerobot_root
         asset_id = self.assets.asset_id or repo_id
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
-            lerobot_root=lerobot_root,
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
@@ -237,6 +225,73 @@ class SimpleDataConfig(DataConfigFactory):
             model_transforms=self.model_transforms(model_config),
         )
 
+#################
+@dataclasses.dataclass(frozen=True)
+class LeRobotCR100DataConfig(DataConfigFactory):
+    """Config for CR100 dual-arm robot with dexterous hands (26-dim state/action).
+
+    Action/state layout (26 dims):
+      [0:7]   left arm joints (radians, ~[-2, 2])
+      [7:13]  left hand fingers (encoder values, ~[0, 1000])
+      [13:20] right arm joints (radians, ~[-2, 2])
+      [20:26] right hand fingers (encoder values, ~[0, 1000])
+
+    Scale differences between arm joints and finger encoders are handled by the
+    normalization pipeline (per-dimension z-score or quantile normalization).
+    """
+
+    # Convert arm joint dimensions to deltas; finger dimensions stay absolute.
+    use_delta_joint_actions: bool = True
+    # Default prompt injected when the "prompt" key is absent.
+    default_prompt: str | None = None
+
+    # Repack transforms: map LeRobot v2.1 dataset keys to the policy's expected keys.
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_high": "observation.images.cam_high",
+                            "cam_left_wrist": "observation.images.cam_left_wrist",
+                            "cam_right_wrist": "observation.images.cam_right_wrist",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+    )
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[cr100_policy.CR100Inputs(model_type=model_config.model_type)],
+            outputs=[cr100_policy.CR100Outputs()],
+        )
+        if self.use_delta_joint_actions:
+            # Arm joints (7 dims) → delta, finger encoders (6 dims) → absolute, for each arm.
+            delta_action_mask = _transforms.make_bool_mask(7, -6, 7, -6)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+
+#################
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotAlohaDataConfig(DataConfigFactory):
@@ -437,143 +492,6 @@ class RLDSDroidDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
-class LeRobotCR100OpenDoorDataConfig(DataConfigFactory):
-    """Config for CR100 Open Door dataset in LeRobot 2.0 format.
-
-    Follows the same pattern as `LeRobotAlohaDataConfig`:
-    - dataset action key is `action` (singular)
-    - repack into {images, state, actions, prompt} for the policy
-    """
-
-    # Convert arm joint dimensions to deltas; finger dimensions stay absolute.
-    use_delta_joint_actions: bool = False
-    # If provided, will be injected into the input data if the "prompt" key is not present.
-    # This is applied *before* repacking (to avoid KeyErrors) and again in model transforms
-    # (to ensure prompt exists for tokenization).
-    default_prompt: str | None = None
-
-    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
-        default=_transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "images": {
-                            "cam_high": "observation.images.cam_high",
-                            # "cam_low": "observation.images.cam_low",
-                            "cam_left_wrist": "observation.images.cam_left_wrist",
-                            "cam_right_wrist": "observation.images.cam_right_wrist",
-                        },
-                        "state": "observation.state",
-                        # Normalize the action key name to plural for model transforms.
-                        "actions": "action",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
-        )
-    )
-
-    action_sequence_keys: Sequence[str] = ("action",)
-
-    @override
-    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        repack_transforms = self.repack_transforms
-        if self.default_prompt is not None:
-            # `RepackTransform` requires all referenced keys to exist. Inject a default
-            # prompt first so datasets without an explicit prompt column still work.
-            repack_transforms = _transforms.Group(
-                inputs=(_transforms.InjectDefaultPrompt(self.default_prompt), *repack_transforms.inputs),
-                outputs=repack_transforms.outputs,
-            )
-
-        data_transforms = _transforms.Group(
-            inputs=[cr100_policy.CR100Inputs(model_type=model_config.model_type)],
-            outputs=[cr100_policy.CR100Outputs()],
-        )
-
-        if self.use_delta_joint_actions:
-            delta_action_mask = _transforms.make_bool_mask(7, -6, 7, -6)
-            data_transforms = data_transforms.push(
-                inputs=[_transforms.DeltaActions(delta_action_mask)],
-                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
-            )
-
-        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
-
-        return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
-            repack_transforms=repack_transforms,
-            data_transforms=data_transforms,
-            model_transforms=model_transforms,
-            action_sequence_keys=self.action_sequence_keys,
-        )
-
-
-@dataclasses.dataclass(frozen=True)
-class LeRobotCR100DataConfig(DataConfigFactory):
-    """Config for CR100 dual-arm robot with dexterous hands (26-dim state/action).
-
-    Action/state layout (26 dims):
-      [0:7]   left arm joints (radians, ~[-2, 2])
-      [7:13]  left hand fingers (encoder values, ~[0, 1000])
-      [13:20] right arm joints (radians, ~[-2, 2])
-      [20:26] right hand fingers (encoder values, ~[0, 1000])
-
-    Scale differences between arm joints and finger encoders are handled by the
-    normalization pipeline (per-dimension z-score or quantile normalization).
-    """
-
-    # Convert arm joint dimensions to deltas; finger dimensions stay absolute.
-    use_delta_joint_actions: bool = True
-    # Default prompt injected when the "prompt" key is absent.
-    default_prompt: str | None = None
-
-    # Repack transforms: map LeRobot v2.1 dataset keys to the policy's expected keys.
-    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
-        default=_transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "images": {
-                            "cam_high": "observation.images.cam_high",
-                            "cam_left_wrist": "observation.images.cam_left_wrist",
-                            "cam_right_wrist": "observation.images.cam_right_wrist",
-                        },
-                        "state": "observation.state",
-                        "actions": "action",
-                    }
-                )
-            ]
-        )
-    )
-    action_sequence_keys: Sequence[str] = ("action",)
-
-    @override
-    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        data_transforms = _transforms.Group(
-            inputs=[cr100_policy.CR100Inputs(model_type=model_config.model_type)],
-            outputs=[cr100_policy.CR100Outputs()],
-        )
-        if self.use_delta_joint_actions:
-            # Arm joints (7 dims) → delta, finger encoders (6 dims) → absolute, for each arm.
-            delta_action_mask = _transforms.make_bool_mask(7, -6, 7, -6)
-            data_transforms = data_transforms.push(
-                inputs=[_transforms.DeltaActions(delta_action_mask)],
-                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
-            )
-
-        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
-
-        return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
-            repack_transforms=self.repack_transforms,
-            data_transforms=data_transforms,
-            model_transforms=model_transforms,
-            action_sequence_keys=self.action_sequence_keys,
-        )
-
-
-@dataclasses.dataclass(frozen=True)
 class LeRobotDROIDDataConfig(DataConfigFactory):
     """
     Example data config for custom DROID dataset in LeRobot format.
@@ -653,7 +571,7 @@ class TrainConfig:
     # Random seed that will be used by random generators during training.
     seed: int = 42
     # Global batch size.
-    batch_size: int = 32
+    batch_size: int = 8
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
     num_workers: int = 2
@@ -911,135 +829,6 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
-    TrainConfig(
-        name="pi05_cr100_open_door",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, action_dim=32, discrete_state_input=False),  # Keep 32 to match pretrained weights
-        data=LeRobotCR100OpenDoorDataConfig(
-            repo_id="cr100_open_door",
-            lerobot_root="/home/x100/wh/cr100_open_door",
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        batch_size=64,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=5000,
-            peak_lr=5e-5,
-            decay_steps=10000,
-            decay_lr=2.5e-6,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=30000,
-    ),
-    # LoRA fine-tuning version of pi05_cr100_open_door (lower memory usage)
-    TrainConfig(
-        name="pi05_cr100_open_door_lora",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_horizon=20,
-            action_dim=32,
-            discrete_state_input=True,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotCR100OpenDoorDataConfig(
-            repo_id="cr100_open_door",
-            lerobot_root="/home/ubuntu/lh/data_set_space/lerobotv21/office_left_by_motionplanning",
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        save_interval=5000,
-        batch_size=32,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=2000,
-            peak_lr=5e-5,
-            decay_steps=30000,
-            decay_lr=5e-6,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=0.5),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=30000,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_horizon=20,
-            action_dim=32,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-    ),
-    TrainConfig(
-        name="pi05_cr100_open_door_action_lora",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_horizon=20,
-            action_dim=32,  # Keep 32 to match pretrained weights, data will be padded from 26 to 32
-            discrete_state_input=True,
-            # paligemma_variant="gemma_2b_lora",  # Enable LoRA for VLM
-            action_expert_variant="gemma_300m_lora",  # Enable LoRA for Action Expert too
-        ),
-        data=LeRobotCR100OpenDoorDataConfig(
-            repo_id="cr100_open_door",
-            lerobot_root="/home/x100/wh/openpi/data/office_left_mp_no_repeat_by_human",
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        batch_size=8,  # Reduced for single 24GB GPU (batch 32 needs ~34GB)
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=500,
-            peak_lr=1e-4,
-            decay_steps=10000,
-            decay_lr=1e-5,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=None,  # Disable EMA for LoRA fine-tuning
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=100000,
-        # Freeze all parameters except LoRA adapters
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_horizon=20,
-            action_dim=32,
-            discrete_state_input=False,
-            # paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",  # Must match model config!
-        ).get_freeze_filter(),
-    ),
-    TrainConfig(
-        name="pi0_cr100_action_expert_lora_freeze_vlm",
-        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b", action_expert_variant="gemma_300m_lora"),
-        data=LeRobotCR100DataConfig(
-            repo_id="lerobot/cr100_left_od_mp_byman_np",
-            assets=AssetsConfig(asset_id="cr100"),
-            default_prompt="cr100 open door",
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        batch_size=16,
-        num_train_steps=500_000,
-        seed=42,
-        num_workers=2,
-        optimizer=_optimizer.AdamW(
-            b1=0.9,
-            b2=0.95,
-            eps=1e-8,
-            weight_decay=1e-10,
-            clip_gradient_norm=1.0,
-        ),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=2.5e-5,
-            decay_steps=500_000,
-            decay_lr=2.5e-6,
-        ),
-        freeze_filter=pi0_config.Pi0Config(
-            paligemma_variant="gemma_2b", action_expert_variant="gemma_300m_lora"
-        ).get_freeze_filter(freeze_all_non_lora=True, trainable_projection=True),
-        ema_decay=None,
-        log_interval=100,
-        save_interval=5_000,
-        keep_period=5_000,
-        fsdp_devices=1,
-        wandb_enabled=True,
-    ),
     #
     # Fine-tuning Aloha configs.
     #
@@ -1196,6 +985,159 @@ _CONFIGS = [
         batch_size=32,
     ),
     #
+    # Fine-tuning CR100 configs.
+    #
+    TrainConfig(
+        name="pi0_cr100",
+        model=pi0_config.Pi0Config(),
+        data=LeRobotCR100DataConfig(
+            repo_id="lerobot/cr100_left_od_mp_byman_np",
+            assets=AssetsConfig(asset_id="cr100"),
+            default_prompt="cr100 open door",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=20_000,
+    ),
+    TrainConfig(
+        name="pi0_fast_cr100",
+        model=pi0_fast.Pi0FASTConfig(action_dim=26, action_horizon=50, max_token_len=300),
+        data=LeRobotCR100DataConfig(
+            repo_id="lerobot/cr100_left_od_mp_byman_np",
+            assets=AssetsConfig(asset_id="cr100"),
+            default_prompt="cr100 open door",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=20_000,
+    ),
+    TrainConfig(
+        name="pi0_cr100_low_mem_finetune",
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotCR100DataConfig(
+            repo_id="lerobot/cr100_left_od_mp_byman_np",
+            assets=AssetsConfig(asset_id="cr100"),
+            default_prompt="cr100 open door",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=20_000,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_cr100_action_expert_lora",
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotCR100DataConfig(
+            repo_id="lerobot/cr100_left_od_mp_byman_np",
+            assets=AssetsConfig(asset_id="cr100"),
+            default_prompt="cr100 open door",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        # --- Training hyperparameters ---
+        batch_size=16,
+        num_train_steps=500_000,
+        seed=42,
+        num_workers=2,
+        # --- Optimizer ---
+        optimizer=_optimizer.AdamW(
+            b1=0.9,
+            b2=0.95,
+            eps=1e-8,
+            weight_decay=1e-10,
+            clip_gradient_norm=1.0,
+        ),
+        # --- Learning rate schedule ---
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=500_000,
+            decay_lr=2.5e-6,
+        ),
+        # --- LoRA: freeze non-LoRA params, no EMA ---
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+        # --- Logging & checkpointing ---
+        log_interval=100,
+        save_interval=5_000,
+        keep_period=5_000,
+        fsdp_devices=1,
+        wandb_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_cr100_action_expert_lora_freeze_vlm",
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotCR100DataConfig(
+            repo_id="lerobot/cr100_left_od_mp_byman_np",
+            assets=AssetsConfig(asset_id="cr100"),
+            default_prompt="cr100 open door",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        batch_size=16,
+        num_train_steps=500_000,
+        seed=42,
+        num_workers=2,
+        optimizer=_optimizer.AdamW(
+            b1=0.9,
+            b2=0.95,
+            eps=1e-8,
+            weight_decay=1e-10,
+            clip_gradient_norm=1.0,
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=500_000,
+            decay_lr=2.5e-6,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(freeze_all_non_lora=True, trainable_projection=True),
+        ema_decay=None,
+        log_interval=100,
+        save_interval=5_000,
+        keep_period=5_000,
+        fsdp_devices=1,
+        wandb_enabled=True,
+    ),
+    TrainConfig(
+        name="pi05_cr100",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotCR100DataConfig(
+            repo_id="lerobot/cr100_left_od_mp_byman_np",
+            assets=AssetsConfig(asset_id="cr100"),
+            default_prompt="cr100 open door",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+    ),
+    TrainConfig(
+        name="pi05_cr100_low_mem_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ),
+        data=LeRobotCR100DataConfig(
+            repo_id="lerobot/cr100_left_od_mp_byman_np",
+            assets=AssetsConfig(asset_id="cr100"),
+            default_prompt="cr100 open door",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+
+    #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
     TrainConfig(
@@ -1243,6 +1185,25 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug_pi05",
         wandb_enabled=False,
+    ),
+    # RTC debug config: uses dummy model for testing RTC inference path.
+    # RTC is inference-only, so the training config is identical to standard pi0.
+    # Use `policy_metadata` to carry the RTC parameters for inference scripts.
+    TrainConfig(
+        name="debug_rtc",
+        model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
+        data=FakeDataConfig(),
+        batch_size=2,
+        num_train_steps=10,
+        overwrite=True,
+        exp_name="debug_rtc",
+        wandb_enabled=False,
+        policy_metadata={
+            "rtc_enabled": True,
+            "rtc_execution_horizon": 25,
+            "rtc_max_guidance_weight": 5.0,
+            "rtc_prefix_attention_schedule": "exp",
+        },
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),

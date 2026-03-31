@@ -65,7 +65,10 @@ class Policy(BasePolicy):
             self._rng = rng or jax.random.key(0)
 
     @override
-    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+    # ===== [RTC] 原始签名 =====
+    # def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:
+    # ===== [RTC] 新签名: 增加 **kwargs 以透传 RTC 参数 =====
+    def infer(self, obs: dict, *, noise: np.ndarray | None = None, **kwargs) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
@@ -80,6 +83,26 @@ class Policy(BasePolicy):
 
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
+
+        # ===== [RTC] 新增: 将 kwargs 中的 RTC 参数转为对应的 JAX/Torch 格式 =====
+        for k, v in kwargs.items():
+            if isinstance(v, (int, float)):
+                if self._is_pytorch_model:
+                    v = torch.tensor(v).to(self._pytorch_device)
+                else:
+                    v = jnp.asarray(v)
+            if isinstance(v, np.ndarray):
+                if self._is_pytorch_model:
+                    v = torch.from_numpy(v).to(self._pytorch_device)
+                    if v.ndim == 2:
+                        v = v.unsqueeze(0)
+                else:
+                    v = jnp.asarray(v)
+                    if v.ndim == 2:
+                        v = v[np.newaxis, ...]
+            sample_kwargs[k] = v
+        # ===== [RTC] 新增结束 =====
+
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
 
@@ -99,11 +122,21 @@ class Policy(BasePolicy):
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
+        # ===== [RTC] 原始代码 =====
+        # outputs = self._output_transform(outputs)
+        # outputs["policy_timing"] = {
+        #     "infer_ms": model_time * 1000,
+        # }
+        # return outputs
+        # ===== [RTC] 新代码: 在 output_transform 之前保存原始 actions (RTC 的 prev_chunk_left_over 需要) =====
+        actions_original = outputs["actions"]
         outputs = self._output_transform(outputs)
+        outputs["actions_original"] = actions_original
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
         return outputs
+        # ===== [RTC] 新代码结束 =====
 
     @property
     def metadata(self) -> dict[str, Any]:

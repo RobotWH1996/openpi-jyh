@@ -26,6 +26,7 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
+from policy_plugin import compute_weighted_mean_loss
 
 
 def init_logging():
@@ -148,7 +149,14 @@ def train_step(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        per_sample_loss = jnp.mean(chunked_loss, axis=-1) if chunked_loss.ndim > 1 else chunked_loss
+        loss, _ = compute_weighted_mean_loss(
+            per_sample_loss,
+            observation.rabc_weight,
+            observation.rabc_delta,
+            epsilon=config.policy_plugin.epsilon,
+        )
+        return loss
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
@@ -183,11 +191,18 @@ def train_step(
             lambda _, x: x.value.ndim > 1,
         ),
     )
+    _, plugin_metrics = compute_weighted_mean_loss(
+        jnp.zeros((observation.state.shape[0],), dtype=loss.dtype),
+        observation.rabc_weight,
+        observation.rabc_delta,
+        epsilon=config.policy_plugin.epsilon,
+    )
     info = {
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
+    info.update(plugin_metrics)
     return new_state, info
 
 

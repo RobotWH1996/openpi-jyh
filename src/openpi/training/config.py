@@ -30,6 +30,7 @@ import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
+from policy_plugin import SARMRABCConfig
 
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
@@ -644,6 +645,9 @@ class TrainConfig:
 
     # Determines the data to be trained on.
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
+
+    # Optional training-time SARM + RA-BC plugin. Disabled by default.
+    policy_plugin: SARMRABCConfig = dataclasses.field(default_factory=SARMRABCConfig)
 
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./assets"

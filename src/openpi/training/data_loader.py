@@ -3,6 +3,7 @@ import logging
 import multiprocessing
 import os
 import typing
+from typing import Callable
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 # Workaround: LeRobot parquet metadata uses "_type": "List" but HuggingFace datasets
@@ -23,6 +24,8 @@ import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
+from policy_plugin import SARMRABCConfig
+from policy_plugin import maybe_load_rabc_index
 
 T_co = TypeVar("T_co", covariant=True)
 
@@ -59,12 +62,23 @@ class DataLoader(Protocol[T_co]):
 
 
 class TransformedDataset(Dataset[T_co]):
-    def __init__(self, dataset: Dataset, transforms: Sequence[_transforms.DataTransformFn]):
+    def __init__(
+        self,
+        dataset: Dataset,
+        transforms: Sequence[_transforms.DataTransformFn],
+        *,
+        sample_metadata_fn: Callable[[int], dict[str, np.ndarray]] | None = None,
+    ):
         self._dataset = dataset
         self._transform = _transforms.compose(transforms)
+        self._sample_metadata_fn = sample_metadata_fn
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
-        return self._transform(self._dataset[index])
+        index_int = index.__index__()
+        sample = self._transform(self._dataset[index_int])
+        if self._sample_metadata_fn is not None:
+            sample = {**sample, **self._sample_metadata_fn(index_int)}
+        return sample
 
     def __len__(self) -> int:
         return len(self._dataset)
@@ -178,7 +192,13 @@ def create_rlds_dataset(
     )
 
 
-def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
+def transform_dataset(
+    dataset: Dataset,
+    data_config: _config.DataConfig,
+    *,
+    skip_norm_stats: bool = False,
+    sample_metadata_fn: Callable[[int], dict[str, np.ndarray]] | None = None,
+) -> Dataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
     if data_config.repo_id != "fake" and not skip_norm_stats:
@@ -197,6 +217,7 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
         ],
+        sample_metadata_fn=sample_metadata_fn,
     )
 
 
@@ -251,7 +272,12 @@ def create_data_loader(
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
+    if config.policy_plugin.enabled and framework == "pytorch":
+        raise NotImplementedError("SARM + RA-BC plugin is only wired into the JAX training path.")
+
     if data_config.rlds_data_dir is not None:
+        if config.policy_plugin.enabled:
+            raise NotImplementedError("SARM + RA-BC plugin currently supports only LeRobot torch-style datasets.")
         return create_rlds_data_loader(
             data_config,
             action_horizon=config.model.action_horizon,
@@ -267,6 +293,7 @@ def create_data_loader(
         model_config=config.model,
         action_horizon=config.model.action_horizon,
         batch_size=config.batch_size,
+        policy_plugin=config.policy_plugin,
         sharding=sharding,
         shuffle=shuffle,
         num_batches=num_batches,
@@ -283,6 +310,7 @@ def create_torch_data_loader(
     action_horizon: int,
     batch_size: int,
     *,
+    policy_plugin: SARMRABCConfig,
     sharding: jax.sharding.Sharding | None = None,
     skip_norm_stats: bool = False,
     shuffle: bool = False,
@@ -309,7 +337,31 @@ def create_torch_data_loader(
         seed: The seed to use for shuffling the data.
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    rabc_index = maybe_load_rabc_index(
+        policy_plugin,
+        repo_id=data_config.repo_id,
+        lerobot_root=data_config.lerobot_root,
+        action_horizon=action_horizon,
+        dataset_len=len(dataset),
+    )
+
+    sample_metadata_fn = None
+    if rabc_index is not None:
+
+        def sample_metadata_fn(index: int) -> dict[str, np.ndarray]:
+            weight, delta = rabc_index.lookup(index)
+            return {
+                "dataset_index": np.asarray(index, dtype=np.int32),
+                "rabc_weight": np.asarray(weight, dtype=np.float32),
+                "rabc_delta": np.asarray(delta, dtype=np.float32),
+            }
+
+    dataset = transform_dataset(
+        dataset,
+        data_config,
+        skip_norm_stats=skip_norm_stats,
+        sample_metadata_fn=sample_metadata_fn,
+    )
 
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size

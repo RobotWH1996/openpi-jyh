@@ -141,15 +141,24 @@ def train_step(
     state: training_utils.TrainState,
     batch: tuple[_model.Observation, _model.Actions],
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
+    """单步优化：前向（可选 RA-BC 加权损失）、反向、优化器更新、指标。"""
+
+    # 用静态图定义与当前参数合并出可训练模型实例
     model = nnx.merge(state.model_def, state.params)
+    # 训练模式：开启 dropout 等，与 compute_loss(..., train=True) 一致
     model.train()
 
     @at.typecheck
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
+        """供自动微分使用的标量损失：先逐样本 loss，再按 RA-BC 权重做 batch 聚合。"""
+
+        # 一般为 [batch, time] 或 [batch]，具体由模型定义 chunk 结构
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+        # 若有尾部维度则对最后一维取均值，使每个 batch 元素一个标量 loss
         per_sample_loss = jnp.mean(chunked_loss, axis=-1) if chunked_loss.ndim > 1 else chunked_loss
+        # RA-BC：sum_i w_i * loss_i / sum_i w_i；rabc_weight 为 None 时内部退化为普通平均
         loss, _ = compute_weighted_mean_loss(
             per_sample_loss,
             observation.rabc_weight,
@@ -158,23 +167,32 @@ def train_step(
         )
         return loss
 
+    # 把全局 step 折进 PRNG，保证每步随机流不同
     train_rng = jax.random.fold_in(rng, state.step)
+    # 从 DataLoader 解包观测与动作
     observation, actions = batch
 
     # Filter out frozen params.
+    # 只对可训练参数求导（DiffState 屏蔽冻结权重）
     diff_state = nnx.DiffState(0, config.trainable_filter)
+    # 对 loss_fn 做反向模式 AD，仅对可训练子集
     loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
 
+    # 仅对可训练参数计算更新量与优化器状态
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
     new_params = optax.apply_updates(params, updates)
 
     # Update the model in place and return the new full state.
+    # 将可训练部分的更新写回完整参数树
     nnx.update(model, new_params)
+    # 更新后快照整棵参数（可训练 + 冻结）
     new_params = nnx.state(model)
 
+    # 步数 +1，并挂上新的优化器状态
     new_state = dataclasses.replace(state, step=state.step + 1, params=new_params, opt_state=new_opt_state)
     if state.ema_decay is not None:
+        # 权重的指数滑动平均，供评估或导出
         new_state = dataclasses.replace(
             new_state,
             ema_params=jax.tree.map(
@@ -183,6 +201,7 @@ def train_step(
         )
 
     # Filter out params that aren't kernels.
+    # 只统计卷积/线性核范数（排除 bias 与 embedding）
     kernel_params = nnx.state(
         model,
         nnx.All(
@@ -191,17 +210,20 @@ def train_step(
             lambda _, x: x.value.ndim > 1,
         ),
     )
+    # 用全零 loss 再调一次加权函数，只取 rabc_mean_weight / rabc_delta_*，避免重复计入真实 loss
     _, plugin_metrics = compute_weighted_mean_loss(
         jnp.zeros((observation.state.shape[0],), dtype=loss.dtype),
         observation.rabc_weight,
         observation.rabc_delta,
         epsilon=config.policy_plugin.epsilon,
     )
+    # 基础标量日志项
     info = {
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
+    # 合并 RA-BC 插件指标到本步日志
     info.update(plugin_metrics)
     return new_state, info
 

@@ -30,6 +30,33 @@ from policy_plugin import maybe_load_rabc_index
 T_co = TypeVar("T_co", covariant=True)
 
 
+class RABCMetadataFn:
+    """可 pickle 的可调用对象：为每个样本生成 RA-BC 元数据。
+
+    用类而非闭包，便于多进程 DataLoader worker 序列化。
+    """
+
+    def __init__(self, rabc_index):
+        """保存预构建的 SARMRABCIndex，供按行号查权重与 delta。"""
+
+        # 来自 sarm_progress.parquet 的按数据集下标权重与 delta
+        self._rabc_index = rabc_index
+
+    def __call__(self, index: int) -> dict[str, np.ndarray]:
+        """将全局数据集行号映射为要并入该样本的 numpy 字段。"""
+
+        # 本行标量权重与进度 delta；越界时 lookup 返回 (1.0, 0.0)
+        weight, delta = self._rabc_index.lookup(index)
+        return {
+            # 记录行号，便于与 parquet 导出对齐排查
+            "dataset_index": np.asarray(index, dtype=np.int32),
+            # 供 compute_weighted_mean_loss 使用的 RA-BC 样本权重
+            "rabc_weight": np.asarray(weight, dtype=np.float32),
+            # 供日志记录的进度 delta（如 batch 内 mean/std）
+            "rabc_delta": np.asarray(delta, dtype=np.float32),
+        }
+
+
 class Dataset(Protocol[T_co]):
     """Interface for a dataset with random access."""
 
@@ -74,8 +101,12 @@ class TransformedDataset(Dataset[T_co]):
         self._sample_metadata_fn = sample_metadata_fn
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
-        index_int = index.__index__()
-        sample = self._transform(self._dataset[index_int])
+        index_int = int(index)
+        try:
+            sample = self._transform(self._dataset[index_int])
+        except Exception:
+            print(f"[坏样本] index={index_int}")
+            raise
         if self._sample_metadata_fn is not None:
             sample = {**sample, **self._sample_metadata_fn(index_int)}
         return sample
@@ -345,16 +376,7 @@ def create_torch_data_loader(
         dataset_len=len(dataset),
     )
 
-    sample_metadata_fn = None
-    if rabc_index is not None:
-
-        def sample_metadata_fn(index: int) -> dict[str, np.ndarray]:
-            weight, delta = rabc_index.lookup(index)
-            return {
-                "dataset_index": np.asarray(index, dtype=np.int32),
-                "rabc_weight": np.asarray(weight, dtype=np.float32),
-                "rabc_delta": np.asarray(delta, dtype=np.float32),
-            }
+    sample_metadata_fn = RABCMetadataFn(rabc_index) if rabc_index is not None else None
 
     dataset = transform_dataset(
         dataset,

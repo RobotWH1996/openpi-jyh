@@ -20,6 +20,22 @@ class RTCProcessorJax:
                 maxlen=rtc_config.debug_maxlen,
             )
 
+    def __eq__(self, other):
+        if not isinstance(other, RTCProcessorJax):
+            return NotImplemented
+        return self.rtc_config == other.rtc_config
+
+    def __hash__(self):
+        cfg = self.rtc_config
+        return hash((
+            cfg.enabled,
+            cfg.prefix_attention_schedule,
+            cfg.max_guidance_weight,
+            cfg.execution_horizon,
+            cfg.debug,
+            cfg.debug_maxlen,
+        ))
+
     def track(
         self,
         time: float | jax.Array,

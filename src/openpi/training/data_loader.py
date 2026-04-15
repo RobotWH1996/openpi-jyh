@@ -5,14 +5,6 @@ import os
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
-# Workaround: LeRobot parquet metadata uses "_type": "List" but HuggingFace datasets
-# expects "Sequence". Without this, Features.from_arrow_schema raises
-# TypeError: must be called with a dataclass type or instance (typing.List is not a dataclass).
-import datasets.features.features as _ds_features
-
-if "List" not in _ds_features._FEATURE_TYPES:
-    _ds_features._FEATURE_TYPES["List"] = _ds_features.Sequence
-
 import jax
 import jax.numpy as jnp
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
@@ -152,6 +144,7 @@ def create_torch_dataset(
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        tolerance_s=0.1,
     )
 
     if data_config.prompt_from_task:

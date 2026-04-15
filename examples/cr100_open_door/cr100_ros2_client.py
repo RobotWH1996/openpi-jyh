@@ -58,19 +58,25 @@ class CR100ROS2ClientNode(Node):
 
     def __init__(
         self,
-        server_host: str = "localhost",
-        server_port: int = 8000,
-        image_topics: list = None,
-        joint_state_topics: list = None,
-        action_topics: list = None,
-        control_frequency: float = 30.0,
-        action_horizon: int = 20,
-        num_action_steps: int = 10,
-        prompt: str = "open the door",
-        record: bool = False,
-        rtc_enabled: bool = False,
-        execution_horizon: int = 10,
-        rtc_blend_steps: int = 5,
+        # --- WebSocket policy server (serve_policy.py) ---
+        server_host: str = "localhost",  # Hostname or IP of the machine running the policy server.
+        server_port: int = 8000,  # TCP port passed to serve_policy.py --port (default 8000).
+        # --- ROS2 I/O (see ros2_bridge.ROS2SensorBridge; None → module defaults) ---
+        image_topics: list = None,  # 3 compressed image topic names (high + left_wrist + right_wrist).
+        joint_state_topics: list = None,  # 4 topics: left_arm, left_hand, right_arm, right_hand states.
+        action_topics: list = None,  # 2 publish topics: left arm cmd + left dexterous hand cmd (CR100 layout).
+        # --- Control loop timing ---
+        control_frequency: float = 30.0,  # Timer Hz: how often control_callback runs (publish + optional infer).
+        # --- Client-side action buffering (independent of model action_horizon in the checkpoint) ---
+        action_horizon: int = 50,  # Max steps stored in classic deque; oldest dropped if a chunk is longer.
+        num_action_steps: int = 30,  # Replenish threshold: fetch new chunk when queue has < this (classic) or ≤ this (RTC).
+        # --- Policy conditioning ---
+        prompt: str = "open the door",  # Task string sent in observation; must match training-style language.
+        record: bool = False,  # If True, log obs/actions for plots via InferenceRecorder.
+        # --- Real-Time Chunking (RTC); server must load an RTC-capable policy if you enable this ---
+        rtc_enabled: bool = False,  # Use background infer thread + ActionQueue merge instead of simple deque.
+        execution_horizon: int = 10,  # RTC: overlap length (steps) for prev_chunk guidance; passed to server infer kwargs.
+        rtc_blend_steps: int = 0,  # RTC: linear blend length at merge between old tail and new chunk head (0 = off).
     ):
         super().__init__('cr100_policy_client')
 
@@ -162,6 +168,7 @@ class CR100ROS2ClientNode(Node):
 
     def _control_callback_classic(self):
         if len(self.action_queue) < self.num_action_steps:
+            time.sleep(1)
             observation = self.sensor.build_observation(self.prompt)
             if observation is None:
                 return
@@ -215,9 +222,58 @@ class CR100ROS2ClientNode(Node):
         self.rtc_thread.start()
         self.get_logger().info("RTC background inference thread started")
 
+    def _warmup_jit(self):
+        """Pre-compile both JAX JIT paths (non-RTC and RTC) before real control starts.
+
+        JAX traces lazily: the first call with a new kwarg signature triggers a
+        full recompilation that takes 5-10 seconds.  During that time the action
+        queue drains, real_delay explodes, and RTC merge corrupts everything.
+
+        By sending two dummy inferences here — one without and one with
+        prev_chunk_left_over — we force both compilation paths to complete
+        *before* any actions are published to the robot.
+        """
+        self.get_logger().info("JIT warm-up: waiting for first observation...")
+        obs = None
+        while obs is None:
+            with self.rtc_latest_obs_lock:
+                obs = self.rtc_latest_obs
+            if obs is None:
+                time.sleep(0.05)
+
+        self.get_logger().info("JIT warm-up [1/2]: compiling non-RTC path...")
+        t0 = time.perf_counter()
+        result1 = self.ws_client.send_observation(obs)
+        t1 = time.perf_counter()
+        self.get_logger().info(f"JIT warm-up [1/2]: done in {(t1-t0)*1000:.0f}ms")
+
+        if result1 is not None:
+            actions_orig = result1.get("actions_original")
+            if actions_orig is not None:
+                dummy_prev = np.array(actions_orig)
+            else:
+                dummy_prev = np.zeros((self.action_horizon, 32), dtype=np.float32)
+        else:
+            dummy_prev = np.zeros((self.action_horizon, 32), dtype=np.float32)
+
+        self.get_logger().info("JIT warm-up [2/2]: compiling RTC path...")
+        t0 = time.perf_counter()
+        self.ws_client.send_observation(
+            obs,
+            prev_chunk_left_over=dummy_prev,
+            inference_delay=4,
+            execution_horizon=self.execution_horizon,
+        )
+        t1 = time.perf_counter()
+        self.get_logger().info(f"JIT warm-up [2/2]: done in {(t1-t0)*1000:.0f}ms")
+        self.get_logger().info("JIT warm-up complete. Starting real RTC inference loop.")
+
     def _rtc_inference_loop(self):
         import math
         time_per_step = 1.0 / self.control_frequency
+        max_delay_steps = self.action_horizon
+
+        self._warmup_jit()
 
         while not self.rtc_stop_event.is_set():
             try:
@@ -243,18 +299,22 @@ class CR100ROS2ClientNode(Node):
                     prev_chunk_left_over = self.rtc_action_queue.get_left_over()
 
                     self.get_logger().info(
-                        f"RTC: Starting inference. Queue={self.rtc_action_queue.qsize()}, "
+                        f"RTC: Starting inference #{self.inference_count + 1}. "
+                        f"Queue={self.rtc_action_queue.qsize()}, "
                         f"est_delay={estimated_delay}, "
                         f"leftover={'None' if prev_chunk_left_over is None else prev_chunk_left_over.shape}"
                     )
 
                     current_time = time.perf_counter()
-                    result = self.ws_client.send_observation(
-                        obs,
-                        prev_chunk_left_over=prev_chunk_left_over,
-                        inference_delay=estimated_delay,
-                        execution_horizon=self.execution_horizon,
-                    )
+                    if prev_chunk_left_over is not None:
+                        result = self.ws_client.send_observation(
+                            obs,
+                            prev_chunk_left_over=prev_chunk_left_over,
+                            inference_delay=estimated_delay,
+                            execution_horizon=self.execution_horizon,
+                        )
+                    else:
+                        result = self.ws_client.send_observation(obs)
                     latency = time.perf_counter() - current_time
                     self.rtc_latency_tracker.add(latency)
                     inference_delay_steps = math.ceil(latency / time_per_step)
@@ -294,15 +354,17 @@ class CR100ROS2ClientNode(Node):
                         )
 
                     real_delay_before = self.rtc_action_queue.get_action_index() - action_index_before
+                    clamped_delay = min(real_delay_before, max_delay_steps)
+
                     self.rtc_action_queue.merge(
                         new_original_actions=original_actions,
                         new_processed_actions=processed_actions,
                         estimated_delay=estimated_delay,
-                        real_delay=real_delay_before,
+                        real_delay=clamped_delay,
                     )
 
                     if real_delay_before > 0:
-                        self.rtc_last_real_delay = real_delay_before
+                        self.rtc_last_real_delay = min(real_delay_before, max_delay_steps)
                     elif inference_delay_steps <= 10:
                         self.rtc_last_real_delay = inference_delay_steps
                     else:
@@ -315,7 +377,8 @@ class CR100ROS2ClientNode(Node):
                     self.get_logger().info(
                         f"RTC Inference #{self.inference_count}: {latency*1000:.1f}ms, "
                         f"queue={self.rtc_action_queue.qsize()}, "
-                        f"delay_steps={inference_delay_steps}"
+                        f"delay_steps={inference_delay_steps}, "
+                        f"clamped_delay={clamped_delay}"
                     )
                 else:
                     time.sleep(0.001)
@@ -433,7 +496,7 @@ def main():
                         help='Enable Real-Time Chunking (RTC) for smooth action transitions')
     parser.add_argument('--execution-horizon', type=int, default=10,
                         help='RTC execution horizon (default: 10)')
-    parser.add_argument('--rtc-blend-steps', type=int, default=0,
+    parser.add_argument('--rtc-blend-steps', type=int, default=3,
                         help='RTC blend steps for linear interpolation at merge (default: 0)')
     parser.add_argument('--test', action='store_true',
                         help='Test connection without ROS2')

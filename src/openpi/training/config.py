@@ -446,7 +446,9 @@ class LeRobotCR100OpenDoorDataConfig(DataConfigFactory):
     """
 
     # Convert arm joint dimensions to deltas; finger dimensions stay absolute.
-    use_delta_joint_actions: bool = False
+    use_delta_joint_actions: bool = True
+    # If True, state/actions use only left arm + left hand (first 13 of 26 dims). Right arm/hand dropped.
+    left_arm_hand_only: bool = True
     # If provided, will be injected into the input data if the "prompt" key is not present.
     # This is applied *before* repacking (to avoid KeyErrors) and again in model transforms
     # (to ensure prompt exists for tokenization).
@@ -487,12 +489,24 @@ class LeRobotCR100OpenDoorDataConfig(DataConfigFactory):
             )
 
         data_transforms = _transforms.Group(
-            inputs=[cr100_policy.CR100Inputs(model_type=model_config.model_type)],
-            outputs=[cr100_policy.CR100Outputs()],
+            inputs=[
+                cr100_policy.CR100Inputs(
+                    model_type=model_config.model_type,
+                    left_arm_hand_only=self.left_arm_hand_only,
+                )
+            ],
+            outputs=[cr100_policy.CR100Outputs(left_arm_hand_only=self.left_arm_hand_only)],
         )
 
         if self.use_delta_joint_actions:
-            delta_action_mask = _transforms.make_bool_mask(7, -6, 7, -6)
+            # 左臂关节 (dim 0-6) 使用 delta；左灵巧手 (dim 7-12) 保持绝对值。
+            # 全 26 维时：右臂 (13-19) 与右灵巧手 (20-25) 同样为绝对值（mask 长度 26）。
+            # 仅 13 维时：mask 与左臂+左手一致。
+            delta_action_mask = (
+                _transforms.make_bool_mask(7, -6)
+                if self.left_arm_hand_only
+                else _transforms.make_bool_mask(7, -19)
+            )
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
@@ -936,11 +950,11 @@ _CONFIGS = [
         name="pi05_cr100_open_door_lora",
         model=pi0_config.Pi0Config(
             pi05=True,
-            action_horizon=20,
+            action_horizon=50,
             action_dim=32,
             discrete_state_input=True,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
         ),
         data=LeRobotCR100OpenDoorDataConfig(
             repo_id="cr100_open_door",
@@ -955,16 +969,16 @@ _CONFIGS = [
             decay_steps=30000,
             decay_lr=5e-6,
         ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=0.5),
+        # optimizer=_optimizer.AdamW(clip_gradient_norm=0.5),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30000,
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
-            action_horizon=20,
+            action_horizon=50,
             action_dim=32,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
         ).get_freeze_filter(),
     ),
     TrainConfig(
@@ -1003,12 +1017,11 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",  # Must match model config!
         ).get_freeze_filter(),
     ),
-    TrainConfig(
-        name="pi0_cr100_action_expert_lora_freeze_vlm",
-        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b", action_expert_variant="gemma_300m_lora"),
+     TrainConfig(
+        name="pi0_cr100_full_finetune",
+        model=pi0_config.Pi0Config(),
         data=LeRobotCR100DataConfig(
-            repo_id="lerobot/cr100_left_od_mp_byman_np",
-            assets=AssetsConfig(asset_id="cr100"),
+            repo_id="lerobot/cr100_v2_mp_np_lerobotv2",
             default_prompt="cr100 open door",
             base_config=DataConfig(prompt_from_task=True),
         ),
@@ -1016,7 +1029,13 @@ _CONFIGS = [
         batch_size=16,
         num_train_steps=500_000,
         seed=42,
-        num_workers=2,
+        num_workers=4,
+        # policy_plugin=SARMRABCConfig(
+        #     enabled=True,
+        #     progress_path="/home/ubuntu/.cache/huggingface/lerobot/lerobot/cr100_v2_mp_np_lerobotv2/sarm_progress.parquet",
+        #     head_mode="sparse",
+        #     kappa=0.01,
+        # ),
         optimizer=_optimizer.AdamW(
             b1=0.9,
             b2=0.95,
@@ -1026,18 +1045,14 @@ _CONFIGS = [
         ),
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
-            peak_lr=2.5e-5,
+            peak_lr=5e-5, # 由于任务相差比较大，所以提高学习率，确保模型可以学到东西。
             decay_steps=500_000,
             decay_lr=2.5e-6,
         ),
-        freeze_filter=pi0_config.Pi0Config(
-            paligemma_variant="gemma_2b", action_expert_variant="gemma_300m_lora"
-        ).get_freeze_filter(freeze_all_non_lora=True, trainable_projection=True),
         ema_decay=None,
-        log_interval=100,
-        save_interval=5_000,
-        keep_period=5_000,
-        fsdp_devices=1,
+        log_interval=1000,
+        save_interval=10_000,
+        keep_period=10_000,
         wandb_enabled=True,
     ),
     #

@@ -97,6 +97,16 @@ class Policy(BasePolicy):
                     if v.ndim == 2:
                         v = v.unsqueeze(0)
                 else:
+                    # Pad prev_chunk_left_over to fixed shape (action_horizon, action_dim)
+                    # so JAX jit sees a single static shape and never recompiles.
+                    if k == "prev_chunk_left_over" and v.ndim == 2:
+                        ah, ad = self._model.action_horizon, self._model.action_dim
+                        if v.shape[0] != ah or v.shape[1] != ad:
+                            padded = np.zeros((ah, ad), dtype=v.dtype)
+                            h = min(v.shape[0], ah)
+                            d = min(v.shape[1], ad)
+                            padded[:h, :d] = v[:h, :d]
+                            v = padded
                     v = jnp.asarray(v)
                     if v.ndim == 2:
                         v = v[np.newaxis, ...]

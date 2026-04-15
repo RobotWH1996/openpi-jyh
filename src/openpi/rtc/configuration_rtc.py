@@ -15,7 +15,7 @@ class RTCConfig:
 
     enabled: bool = False
     prefix_attention_schedule: RTCAttentionSchedule = RTCAttentionSchedule.LINEAR
-    max_guidance_weight: float = 10.0
+    max_guidance_weight: float = 1.0
     execution_horizon: int = 20.0
 
     debug: bool = False

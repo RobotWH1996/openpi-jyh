@@ -83,11 +83,11 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
     ),
     EnvMode.CR100_OPEN_DOOR: Checkpoint(
         config="pi05_cr100_open_door_lora",
-        dir="/home/x100/wh/openpi/checkpoints/pi05_cr100_open_door_lora/50000",
+        dir="/home/x100/wh/openpi/checkpoints/pi05_cr100_open_door_lora/pi05_cr100_open_door_lora/45000",
     ),
     EnvMode.CR100_OPEN_DOOR_PI0: Checkpoint(
-        config="pi0_cr100_action_expert_lora_freeze_vlm",
-        dir="/home/x100/wh/openpi/checkpoints/pi/150000",
+        config="pi0_cr100_full_finetune",
+        dir="/home/x100/wh/openpi/checkpoints/pi0/checkpoints/pi0_cr100_full_finetune/pi0_cr100_full_finetune/20000",
     ),
 }
 
